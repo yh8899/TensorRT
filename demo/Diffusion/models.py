@@ -68,6 +68,304 @@ class Optimizer():
         if return_onnx:
             return onnx_graph
 
+    def remove_casts(self):
+        nRemoveCastNode = 0
+        for node in self.graph.nodes:
+            # Remove Cast nodes before qkv gemm
+            if node.op in ["LayerNormalization"] and \
+                len(node.o().outputs[0].outputs) == 3 and \
+                node.o().o().op == "MatMul" and node.o().o(1).op == "MatMul" and node.o().o(2).op == "MatMul":
+                for i in range(len(node.o().outputs[0].outputs)):
+                    matMulNode = node.o().o()
+                    matMulNode.inputs[0] = node.outputs[0]
+                    nRemoveCastNode += 1
+            
+            # Remove double cast nodes after Softmax Node
+            if node.op == "Softmax" and node.o().op == "Cast" and node.o().o().op == "Cast":
+                node.o().o().o().inputs[0] = node.outputs[0]
+                nRemoveCastNode += 1
+
+        self.cleanup()
+        return nRemoveCastNode
+
+    def fuse_kv(self, node_k, node_v, fused_kv_idx, heads, num_dynamic=0):
+        # Get weights of K
+        weights_k = node_k.inputs[1].values
+        # Get weights of V
+        weights_v = node_v.inputs[1].values
+        # Input number of channels to K and V
+        C = weights_k.shape[0]
+        # Number of heads
+        H = heads
+        # Dimension per head
+        D = weights_k.shape[1] // H
+
+        # Concat and interleave weights such that the output of fused KV GEMM has [b, s_kv, h, 2, d] shape
+        weights_kv = np.dstack([weights_k.reshape(C, H, D), weights_v.reshape(C, H, D)]).reshape(C, 2 * H * D)
+
+        # K and V have the same input
+        input_tensor = node_k.inputs[0]
+        # K and V must have the same output which we feed into fmha plugin
+        output_tensor_k = node_k.outputs[0]
+        # Create tensor
+        constant_weights_kv = gs.Constant("Weights_KV_{}".format(fused_kv_idx), np.ascontiguousarray(weights_kv))
+
+        # Create fused KV node
+        fused_kv_node = gs.Node(op="MatMul", name="MatMul_KV_{}".format(fused_kv_idx), inputs=[input_tensor, constant_weights_kv], outputs=[output_tensor_k])
+        self.graph.nodes.append(fused_kv_node)
+
+        # Connect the output of fused node to the inputs of the nodes after K and V
+        node_v.o(num_dynamic).inputs[0] = output_tensor_k
+        node_k.o(num_dynamic).inputs[0] = output_tensor_k
+        for i in range(0,num_dynamic):
+            node_v.o().inputs.clear()
+            node_k.o().inputs.clear()
+
+        # Clear inputs and outputs of K and V to ge these nodes cleared
+        node_k.outputs.clear()
+        node_v.outputs.clear()
+        node_k.inputs.clear()
+        node_v.inputs.clear()
+
+        self.cleanup()
+        return fused_kv_node
+
+    def insert_fmhca(self, node_q, node_kv, final_tranpose, mhca_idx, heads, num_dynamic=0):
+        # Get inputs and outputs for the fMHCA plugin
+        # We take an output of reshape that follows the Q GEMM
+        output_q = node_q.o(num_dynamic).o().inputs[0]
+        output_kv = node_kv.o().inputs[0]
+        output_final_tranpose = final_tranpose.outputs[0]
+
+        # Clear the inputs of the nodes that follow the Q and KV GEMM
+        # to delete these subgraphs (it will be substituted by fMHCA plugin)
+        node_kv.outputs[0].outputs[0].inputs.clear()
+        node_kv.outputs[0].outputs[0].inputs.clear()
+        node_q.o(num_dynamic).o().inputs.clear()
+        for i in range(0,num_dynamic):
+            node_q.o(i).o().o(1).inputs.clear()
+
+        weights_kv = node_kv.inputs[1].values
+        dims_per_head = weights_kv.shape[1] // (heads * 2)
+
+        # Reshape dims
+        shape = gs.Constant("Shape_KV_{}".format(mhca_idx), np.ascontiguousarray(np.array([0, 0, heads, 2, dims_per_head], dtype=np.int64)))
+
+        # Reshape output tensor
+        output_reshape = gs.Variable("ReshapeKV_{}".format(mhca_idx), np.dtype(np.float16), None)
+        # Create fMHA plugin
+        reshape = gs.Node(op="Reshape", name="Reshape_{}".format(mhca_idx), inputs=[output_kv, shape], outputs=[output_reshape])
+        # Insert node
+        self.graph.nodes.append(reshape)
+
+        # Create fMHCA plugin
+        fmhca = gs.Node(op="fMHCA", name="fMHCA_{}".format(mhca_idx), inputs=[output_q, output_reshape], outputs=[output_final_tranpose])
+        # Insert node
+        self.graph.nodes.append(fmhca)
+
+        # Connect input of fMHCA to output of Q GEMM
+        node_q.o(num_dynamic).outputs[0] = output_q
+
+        if num_dynamic > 0:
+            reshape2_input1_out = gs.Variable("Reshape2_fmhca{}_out".format(mhca_idx), np.dtype(np.int64), None)
+            reshape2_input1_shape = gs.Node("Shape", "Reshape2_fmhca{}_shape".format(mhca_idx), inputs=[node_q.inputs[0]], outputs=[reshape2_input1_out])
+            self.graph.nodes.append(reshape2_input1_shape)
+            final_tranpose.o().inputs[1] = reshape2_input1_out
+
+        # Clear outputs of transpose to get this subgraph cleared
+        final_tranpose.outputs.clear()
+
+        self.cleanup()
+
+    def mha_mhca_detected(self, node, mha):
+        # Go from V GEMM down to the S*V MatMul and all way up to K GEMM
+        # If we are looking for MHCA inputs of two matmuls (K and V) must be equal.
+        # If we are looking for MHA inputs (K and V) must be not equal.
+        if node.op == "MatMul" and len(node.outputs) == 1 and \
+            ((mha and len(node.inputs[0].inputs) > 0  and node.i().op == 'LayerNormalization') or \
+            (not mha and len(node.inputs[0].inputs) == 0)):
+
+            if node.o().op == 'Shape':
+                if node.o(1).op == 'Shape':
+                    num_dynamic_kv = 3 if node.o(2).op == 'Shape' else 2
+                else:
+                    num_dynamic_kv = 1
+                # For Cross-Attention, if batch axis is dynamic (in QKV), assume H*W (in Q) is dynamic as well
+                num_dynamic_q = num_dynamic_kv if mha else num_dynamic_kv + 1
+            else:
+                num_dynamic_kv = 0
+                num_dynamic_q = 0
+
+            o = node.o(num_dynamic_kv)
+            if o.op == "Reshape" and \
+                o.o().op == "Transpose" and \
+                o.o().o().op == "Reshape" and \
+                o.o().o().o().op == "MatMul" and \
+                o.o().o().o().i(0).op == "Softmax" and \
+                o.o().o().o().i(1).op == "Reshape" and \
+                o.o().o().o().i(0).i().op == "Mul" and \
+                o.o().o().o().i(0).i().i().op == "MatMul" and \
+                o.o().o().o().i(0).i().i().i(0).op == "Reshape" and \
+                o.o().o().o().i(0).i().i().i(1).op == "Transpose" and \
+                o.o().o().o().i(0).i().i().i(1).i().op == "Reshape" and \
+                o.o().o().o().i(0).i().i().i(1).i().i().op == "Transpose" and \
+                o.o().o().o().i(0).i().i().i(1).i().i().i().op == "Reshape" and \
+                o.o().o().o().i(0).i().i().i(1).i().i().i().i().op == "MatMul" and \
+                node.name != o.o().o().o().i(0).i().i().i(1).i().i().i().i().name:
+                # "len(node.outputs) == 1" to make sure we are not in the already fused node
+                node_q = o.o().o().o().i(0).i().i().i(0).i().i().i()
+                node_k = o.o().o().o().i(0).i().i().i(1).i().i().i().i()
+                node_v = node
+                final_tranpose = o.o().o().o().o(num_dynamic_q).o()
+                # Sanity check to make sure that the graph looks like expected
+                if node_q.op == "MatMul" and final_tranpose.op == "Transpose":
+                    return True, num_dynamic_q, num_dynamic_kv, node_q, node_k, node_v, final_tranpose
+        return False, 0, 0, None, None, None, None
+    
+    def fuse_kv_insert_fmhca(self, heads, mhca_index, sm):
+        nodes = self.graph.nodes
+        # Iterate over graph and search for MHCA pattern
+        for idx, _ in enumerate(nodes):
+            # fMHCA can't be at the 2 last layers of the network. It is a guard from OOB
+            if idx + 1 > len(nodes) or idx + 2 > len(nodes):
+                continue
+
+            # Get anchor nodes for fusion and fMHCA plugin insertion if the MHCA is detected
+            detected, num_dynamic_q, num_dynamic_kv, node_q, node_k, node_v, final_tranpose = \
+                self.mha_mhca_detected(nodes[idx], mha=False)
+            if detected:
+                assert num_dynamic_q == 0 or num_dynamic_q == num_dynamic_kv + 1
+                # Skip the FMHCA plugin for SM75 except for when the dim per head is 40.
+                if sm == 75 and node_q.inputs[1].shape[1] // heads == 160:
+                    continue
+                # Fuse K and V GEMMS
+                node_kv = self.fuse_kv(node_k, node_v, mhca_index, heads, num_dynamic_kv)
+                # Insert fMHCA plugin
+                self.insert_fmhca(node_q, node_kv, final_tranpose, mhca_index, heads, num_dynamic_q)
+                return True
+        return False
+    
+    def insert_fmhca_plugin(self, num_heads, sm):
+        mhca_index = 0
+        while self.fuse_kv_insert_fmhca(num_heads, mhca_index, sm):
+            mhca_index += 1
+        return mhca_index
+    
+    def fuse_qkv(self, node_q, node_k, node_v, fused_qkv_idx, heads, num_dynamic=0):
+        # Get weights of Q
+        weights_q = node_q.inputs[1].values
+        # Get weights of K
+        weights_k = node_k.inputs[1].values
+        # Get weights of V
+        weights_v = node_v.inputs[1].values
+
+        # Input number of channels to Q, K and V
+        C = weights_k.shape[0]
+        # Number of heads
+        H = heads
+        # Hidden dimension per head
+        D = weights_k.shape[1] // H
+
+        # Concat and interleave weights such that the output of fused QKV GEMM has [b, s, h, 3, d] shape
+        weights_qkv = np.dstack([weights_q.reshape(C, H, D), weights_k.reshape(C, H, D), weights_v.reshape(C, H, D)]).reshape(C, 3 * H * D)
+
+        input_tensor = node_k.inputs[0]  # K and V have the same input
+        # Q, K and V must have the same output which we feed into fmha plugin
+        output_tensor_k = node_k.outputs[0]
+        # Concat and interleave weights such that the output of fused QKV GEMM has [b, s, h, 3, d] shape
+        constant_weights_qkv = gs.Constant("Weights_QKV_{}".format(fused_qkv_idx), np.ascontiguousarray(weights_qkv))
+
+        # Created a fused node
+        fused_qkv_node = gs.Node(op="MatMul", name="MatMul_QKV_{}".format(fused_qkv_idx), inputs=[input_tensor, constant_weights_qkv], outputs=[output_tensor_k])
+        self.graph.nodes.append(fused_qkv_node)
+
+        # Connect the output of the fused node to the inputs of the nodes after Q, K and V
+        node_q.o(num_dynamic).inputs[0] = output_tensor_k
+        node_k.o(num_dynamic).inputs[0] = output_tensor_k
+        node_v.o(num_dynamic).inputs[0] = output_tensor_k
+        for i in range(0,num_dynamic):
+            node_q.o().inputs.clear()
+            node_k.o().inputs.clear()
+            node_v.o().inputs.clear()
+
+        # Clear inputs and outputs of Q, K and V to ge these nodes cleared
+        node_q.outputs.clear()
+        node_k.outputs.clear()
+        node_v.outputs.clear()
+
+        node_q.inputs.clear()
+        node_k.inputs.clear()
+        node_v.inputs.clear()
+
+        self.cleanup()
+        return fused_qkv_node
+    
+    def insert_fmha(self, node_qkv, final_tranpose, mha_idx, heads, num_dynamic=0):
+        # Get inputs and outputs for the fMHA plugin
+        output_qkv = node_qkv.o().inputs[0]
+        output_final_tranpose = final_tranpose.outputs[0]
+
+        # Clear the inputs of the nodes that follow the QKV GEMM
+        # to delete these subgraphs (it will be substituted by fMHA plugin)
+        node_qkv.outputs[0].outputs[2].inputs.clear()
+        node_qkv.outputs[0].outputs[1].inputs.clear()
+        node_qkv.outputs[0].outputs[0].inputs.clear()
+
+        weights_qkv = node_qkv.inputs[1].values
+        dims_per_head = weights_qkv.shape[1] // (heads * 3)
+
+        # Reshape dims
+        shape = gs.Constant("Shape_QKV_{}".format(mha_idx), np.ascontiguousarray(np.array([0, 0, heads, 3, dims_per_head], dtype=np.int64)))
+
+        # Reshape output tensor
+        output_shape = gs.Variable("ReshapeQKV_{}".format(mha_idx), np.dtype(np.float16), None)
+        # Create fMHA plugin
+        reshape = gs.Node(op="Reshape", name="Reshape_{}".format(mha_idx), inputs=[output_qkv, shape], outputs=[output_shape])
+        # Insert node
+        self.graph.nodes.append(reshape)
+
+        # Create fMHA plugin
+        fmha = gs.Node(op="fMHA_V2", name="fMHA_{}".format(mha_idx), inputs=[output_shape], outputs=[output_final_tranpose])
+        # Insert node
+        self.graph.nodes.append(fmha)
+
+        if num_dynamic > 0:
+            reshape2_input1_out = gs.Variable("Reshape2_{}_out".format(mha_idx), np.dtype(np.int64), None)
+            reshape2_input1_shape = gs.Node("Shape", "Reshape2_{}_shape".format(mha_idx), inputs=[node_qkv.inputs[0]], outputs=[reshape2_input1_out])
+            self.graph.nodes.append(reshape2_input1_shape)
+            final_tranpose.o().inputs[1] = reshape2_input1_out
+
+        # Clear outputs of transpose to get this subgraph cleared
+        final_tranpose.outputs.clear()
+
+        self.cleanup()
+
+    def fuse_qkv_insert_fmha(self, heads, mha_index):
+        nodes = self.graph.nodes
+        # Iterate over graph and search for MHA pattern
+        for idx, _ in enumerate(nodes):
+            # fMHA can't be at the 2 last layers of the network. It is a guard from OOB
+            if idx + 1 > len(nodes) or idx + 2 > len(nodes):
+                continue
+
+            # Get anchor nodes for fusion and fMHA plugin insertion if the MHA is detected
+            detected, num_dynamic_q, num_dynamic_kv, node_q, node_k, node_v, final_tranpose = \
+                self.mha_mhca_detected(nodes[idx], mha=True)
+            if detected:
+                assert num_dynamic_q == num_dynamic_kv
+                # Fuse Q, K and V GEMMS
+                node_qkv = self.fuse_qkv(node_q, node_k, node_v, mha_index, heads, num_dynamic_kv)
+                # Insert fMHA plugin
+                self.insert_fmha(node_qkv, final_tranpose, mha_index, heads, num_dynamic_kv)
+                return True
+        return False
+    
+    def insert_fmha_plugin(self, num_heads):
+        mha_index = 0
+        while self.fuse_qkv_insert_fmha(num_heads, mha_index):
+            mha_index += 1
+        return mha_index
+
 def get_path(version, inpaint=False):
     if version == "1.4":
         if inpaint:
@@ -78,7 +376,7 @@ def get_path(version, inpaint=False):
         if inpaint:
             return "runwayml/stable-diffusion-inpainting"
         else:
-            return "runwayml/stable-diffusion-v1-5"
+            return "/root/yh7/runwayml/stable-diffusion-v1-5"
     elif version == "2.0-base":
         if inpaint:
             return "stabilityai/stable-diffusion-2-inpainting"
@@ -319,6 +617,33 @@ class UNet(BaseModel):
             torch.tensor([1.], dtype=torch.float32, device=self.device),
             torch.randn(2*batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=self.device)
         )
+    
+    def optimize(self, onnx_graph):
+        opt = Optimizer(onnx_graph, verbose=self.verbose)
+        opt.info(self.name + ': original')
+        opt.cleanup()
+        opt.info(self.name + ': cleanup')
+        
+        num_heads = 8
+        opt.remove_casts()
+        opt.info(self.name + ': remove cast')
+        
+        opt.fold_constants()
+        opt.info(self.name + ': fold constants')
+        opt.infer_shapes()
+        opt.info(self.name + ': shape inference')
+        
+        num_fmha_inserted = opt.insert_fmha_plugin(num_heads=num_heads)
+        opt.info('UNet: inserted '+str(num_fmha_inserted)+' fMHA plugins')
+        
+        props = cudart.cudaGetDeviceProperties(0)[1]
+        sm = props.major * 10 + props.minor
+        num_fmhca_inserted = opt.insert_fmhca_plugin(num_heads=num_heads, sm=sm)
+        opt.info('UNet: inserted '+str(num_fmhca_inserted)+' fMHCA plugins')
+        
+        onnx_opt_graph = opt.cleanup(return_onnx=True)
+        opt.info(self.name + ': finished')
+        return onnx_opt_graph
 
 def make_UNet(version, hf_token, device, verbose, max_batch_size, inpaint=False):
     return UNet(hf_token=hf_token, fp16=True, device=device, verbose=verbose, path=get_path(version, inpaint=inpaint),
