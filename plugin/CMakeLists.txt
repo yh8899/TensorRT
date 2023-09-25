@@ -85,7 +85,16 @@ if(BERT_GENCODES)
     include_directories(bertQKVToContextPlugin/fused_multihead_attention/include bertQKVToContextPlugin/fused_multihead_attention_v2/include)
 endif()
 
-include_directories(common common/kernels ${CMAKE_SOURCE_DIR}/third_party)
+# Add Stable Diffusion sources if ${STABLE_DIFFUSION_GENCODES} was populated
+if(STABLE_DIFFUSION_GENCODES)
+    set(STABLE_DIFFUSION_CU_SOURCES)
+    set(PLUGIN_LISTS
+        ${PLUGIN_LISTS}
+        multiHeadFlashAttentionPlugin
+        )
+endif()
+
+include_directories(common common/kernels ${CMAKE_SOURCE_DIR}/third_party ${CMAKE_SOURCE_DIR}/third_party/cutlass/include)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
     include_directories(${PLUGIN_ITER})
@@ -101,6 +110,11 @@ list(APPEND PLUGIN_SOURCES "${PLUGIN_CU_SOURCES}")
 if (BERT_CU_SOURCES)
     set_source_files_properties(${BERT_CU_SOURCES} PROPERTIES COMPILE_FLAGS "${BERT_GENCODES} ${ENABLED_SMS}")
     list(APPEND PLUGIN_SOURCES "${BERT_CU_SOURCES}")
+endif()
+
+if (STABLE_DIFFUSION_CU_SOURCES)
+    set_source_files_properties(${STABLE_DIFFUSION_CU_SOURCES} PROPERTIES COMPILE_FLAGS "${STABLE_DIFFUSION_GENCODES} ${ENABLED_SMS}")
+    list(APPEND PLUGIN_SOURCES "${STABLE_DIFFUSION_CU_SOURCES}")
 endif()
 
 list(APPEND PLUGIN_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/api/inferPlugin.cpp")
@@ -124,7 +138,7 @@ if (CUDA_VERSION VERSION_LESS 11.0)
 endif()
 
 set_target_properties(${SHARED_TARGET} PROPERTIES
-    CXX_STANDARD "14"
+    CXX_STANDARD "17"
     CXX_STANDARD_REQUIRED "YES"
     CXX_EXTENSIONS "NO"
     ARCHIVE_OUTPUT_DIRECTORY "${TRT_OUT_DIR}"
@@ -142,7 +156,7 @@ set_target_properties(${SHARED_TARGET} PROPERTIES DEBUG_POSTFIX ${TRT_DEBUG_POST
 
 set_target_properties(${SHARED_TARGET} PROPERTIES VERSION ${TRT_VERSION} SOVERSION ${TRT_SOVERSION} )
 
-set_property(TARGET ${SHARED_TARGET} PROPERTY CUDA_STANDARD 14)
+set_property(TARGET ${SHARED_TARGET} PROPERTY CUDA_STANDARD 17)
 
 target_link_libraries(${SHARED_TARGET}
     ${CUBLAS_LIB}
@@ -173,7 +187,7 @@ target_include_directories(${STATIC_TARGET}
 )
 
 set_target_properties(${STATIC_TARGET} PROPERTIES
-    CXX_STANDARD "14"
+    CXX_STANDARD "17"
     CXX_STANDARD_REQUIRED "YES"
     CXX_EXTENSIONS "NO"
     ARCHIVE_OUTPUT_DIRECTORY "${TRT_OUT_DIR}"
@@ -187,7 +201,7 @@ set_target_properties(${STATIC_TARGET} PROPERTIES DEBUG_POSTFIX ${TRT_DEBUG_POST
 
 set_target_properties(${STATIC_TARGET} PROPERTIES VERSION ${TRT_VERSION} SOVERSION ${TRT_SOVERSION} )
 
-set_property(TARGET ${STATIC_TARGET} PROPERTY CUDA_STANDARD 14)
+set_property(TARGET ${STATIC_TARGET} PROPERTY CUDA_STANDARD 17)
 
 #########################################################################################
 

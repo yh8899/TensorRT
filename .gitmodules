@@ -10,3 +10,6 @@
 	path = parsers/onnx
 	url = https://github.com/onnx/onnx-tensorrt.git
 	branch = main
+[submodule "third_party/cutlass"]
+	path = third_party/cutlass
+	url = https://github.com/NVIDIA/cutlass.git

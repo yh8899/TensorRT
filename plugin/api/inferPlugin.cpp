@@ -53,6 +53,7 @@
 #include "specialSlicePlugin/specialSlicePlugin.h"
 #include "splitPlugin/split.h"
 #include "voxelGeneratorPlugin/voxelGenerator.h"
+#include "multiHeadFlashAttentionPlugin/fmhaPlugin.h"
 
 #include <algorithm>
 #include <array>
@@ -218,6 +219,10 @@ extern "C"
         initializePlugin<nvinfer1::plugin::SpecialSlicePluginCreator>(logger, libNamespace);
         initializePlugin<nvinfer1::plugin::SplitPluginCreator>(logger, libNamespace);
         initializePlugin<nvinfer1::plugin::VoxelGeneratorPluginCreator>(logger, libNamespace);
+#if defined(ENABLE_SM80) || defined(ENABLE_SM86) || defined(ENABLE_SM89)
+        initializePlugin<nvinfer1::plugin::FMHAPluginCreator>(logger, libNamespace);
+        // initializePlugin<nvinfer1::plugin::FMHCAPluginCreator>(logger, libNamespace);
+#endif // defined(ENABLE_SM80) || defined(ENABLE_SM86) || defined(ENABLE_SM89)
         return true;
     }
 } // extern "C"
